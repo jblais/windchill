@@ -1,0 +1,147 @@
+name: windchill
+
+services:
+  # ---------------------------------------------------------------- SQL Server
+  mssql:
+    image: mcr.microsoft.com/mssql/server:2022-latest
+    container_name: wc-mssql
+    hostname: mssql
+    environment:
+      ACCEPT_EULA: "Y"
+      MSSQL_PID: Developer
+      MSSQL_SA_PASSWORD: ${MSSQL_SA_PASSWORD}
+      MSSQL_COLLATION: SQL_Latin1_General_CP1_CI_AS
+    ports:
+      - "1433:1433"
+    volumes:
+      - mssql-data:/var/opt/mssql
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/mssql-tools18/bin/sqlcmd -C -S localhost -U sa -P \"$$MSSQL_SA_PASSWORD\" -Q 'SELECT 1' -b -o /dev/null"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 30s
+    networks: [wcnet]
+    restart: unless-stopped
+
+  # Job unique : création de la base, du login et des options d'isolation
+  mssql-init:
+    image: mcr.microsoft.com/mssql/server:2022-latest
+    container_name: wc-mssql-init
+    depends_on:
+      mssql:
+        condition: service_healthy
+    environment:
+      MSSQL_SA_PASSWORD: ${MSSQL_SA_PASSWORD}
+      WC_DB_NAME: ${WC_DB_NAME}
+      WC_DB_USER: ${WC_DB_USER}
+      WC_DB_PASSWORD: ${WC_DB_PASSWORD}
+    volumes:
+      - ./mssql/init.sql:/init.sql:ro,z
+    entrypoint:
+      - /bin/bash
+      - -c
+      - >
+        /opt/mssql-tools18/bin/sqlcmd -C -S mssql -U sa -P "$$MSSQL_SA_PASSWORD" -b
+        -v WC_DB="$$WC_DB_NAME" -v WC_USER="$$WC_DB_USER" -v WC_PASS="$$WC_DB_PASSWORD"
+        -i /init.sql
+    networks: [wcnet]
+    restart: "no"
+
+  # ------------------------------------------------------------------- OpenDJ
+  opendj:
+    image: openidentityplatform/opendj:4.6.4   # vérifier le tag disponible
+    container_name: wc-opendj
+    hostname: opendj
+    environment:
+      BASE_DN: ${LDAP_BASE_DN}
+      ROOT_USER_DN: ${LDAP_ROOT_DN}
+      ROOT_PASSWORD: ${LDAP_ROOT_PASSWORD}
+      ADD_BASE_ENTRY: "--addBaseEntry"
+    ports:
+      - "1389:1389"
+      - "1636:1636"
+      - "4444:4444"
+    volumes:
+      - opendj-data:/opt/opendj/data
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/opendj/bin/ldapsearch -h localhost -p 1389 -D \"$$ROOT_USER_DN\" -w \"$$ROOT_PASSWORD\" -b \"$$BASE_DN\" -s base '(objectClass=*)' dn >/dev/null 2>&1"]
+      interval: 15s
+      timeout: 10s
+      retries: 20
+      start_period: 40s
+    networks: [wcnet]
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------- Windchill
+  windchill:
+    build:
+      context: ./windchill
+      args:
+        CORRETTO_VERSION: ${CORRETTO_VERSION}
+    image: local/windchill:13.1
+    pull_policy: build
+    container_name: windchill
+    hostname: ${WC_HOSTNAME}
+    depends_on:
+      mssql-init:
+        condition: service_completed_successfully
+      opendj:
+        condition: service_healthy
+    environment:
+      WC_HOSTNAME: ${WC_HOSTNAME}
+      WC_HTTP_PORT: ${WC_HTTP_PORT}
+      WC_XMX: ${WC_XMX}
+      PSI_INSTALL_CMD: ${PSI_INSTALL_CMD}
+      PSI_INSTALL_CMD_UI: ${PSI_INSTALL_CMD_UI}
+      DB_HOST: mssql
+      DB_PORT: "1433"
+      DB_NAME: ${WC_DB_NAME}
+      DB_USER: ${WC_DB_USER}
+      DB_PASSWORD: ${WC_DB_PASSWORD}
+      LDAP_HOST: opendj
+      LDAP_PORT: "1389"
+      LDAP_BASE_DN: ${LDAP_BASE_DN}
+      LDAP_ROOT_DN: ${LDAP_ROOT_DN}
+      LDAP_ROOT_PASSWORD: ${LDAP_ROOT_PASSWORD}
+      LAX_DEBUG_VERBOSE: ${LAX_DEBUG_VERBOSE}
+      LAX_DEBUG: ${LAX_DEBUG}
+      DISPLAY: ${DISPLAY}
+      XAUTHORITY: /home/wind/.Xauthority
+    ports:
+      - "${WC_HTTP_PORT}:${WC_HTTP_PORT}"
+      - ${SOLR_PORT}:${SOLR_PORT}
+      - "22:22"
+      - "80:80"
+      - "443:443"
+      - "5600:5600"
+      - "9000:9000"
+    volumes:
+      - wc-data:/opt/ptc:rw                       # installation Windchill persistante
+      - wc-vault:/opt/ptc/vaults:rw               # vaults de contenu
+      - ./media:/opt/ptc-media:rw              # média d'installation PTC (non fourni)
+      - ./windchill/hooks:/opt/ptc-scripts/hooks:rw
+    ulimits:
+      nofile: { soft: 65536, hard: 65536 }
+      nproc: 65536
+    tmpfs: #https://www.ptc.com/en/support/article/cs178146
+      - /tmp:exec,mode=1777,size=8G
+      - /var/tmp:exec,mode=1777,size=4g
+    tty: true
+    stdin_open: true
+    stop_signal: SIGTERM
+    shm_size: "1gb"
+    mem_limit: 16g
+    stop_grace_period: 180s
+    networks: [wcnet]
+    restart: unless-stopped
+
+networks:
+  wcnet:
+    driver: bridge
+
+volumes:
+  mssql-data:
+  opendj-data:
+  wc-data:
+  wc-vault:
